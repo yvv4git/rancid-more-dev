@@ -1,0 +1,332 @@
+#! /usr/bin/perl
+##
+##
+#
+# usage: dlrancid [-dV] [-l] [-f filename | hostname]
+#
+use Getopt::Std;
+getopts('dflV');
+
+if ($opt_V) {
+	print "rancid 2.3.6\n";
+	exit(0);
+}
+
+$log = $opt_l;
+$debug = $opt_d;
+$debug = 1;
+$file = $opt_f;
+$host = $ARGV[0];
+$found_end = 0;
+$timeo = 10;  			# время в секундах на подождать
+
+my( @commandtable, %commands,  @commands);# command lists
+my($aclsort) = ("ipsort");		# ACL sorting mode
+my($filter_commstr);			# SNMP community string filtering
+my($filter_pwds);			# password filtering mode
+
+# This routine is used to print out the router configuration
+sub ProcessHistory {
+	my($new_hist_tag,$new_command,$command_string, @string) = ( @_);
+	if ((($new_hist_tag ne $hist_tag) || ($new_command ne $command))
+		&& scalar(%history)) {
+		print eval "$command \%history";
+		undef %history;
+	}
+	if (($new_hist_tag) && ($new_command) && ($command_string)) {
+		if ($history{$command_string}) {
+			$history{$command_string} = "$history{$command_string} @string";
+		} else {
+			$history{$command_string} = " @string";
+		}
+	} elsif (($new_hist_tag) && ($new_command)) {
+		$history{++$#history} = " @string";
+	} else {
+		print " @string";
+	}
+	$hist_tag = $new_hist_tag;
+	$command = $new_command;
+	1;
+}
+
+=comment
+sub numerically { $a <=> $b; }
+
+# This is a sort routine that will sort numerically on the
+# keys of a hash as if it were a normal array.
+sub keynsort {
+	local(%lines) =  @_;
+	local($i) = 0;
+	local( @sorted_lines);
+	foreach $key (sort numerically keys(%lines)) {
+		$sorted_lines[$i] = $lines{$key};
+		$i++;
+	}
+	@sorted_lines;
+}
+
+# This is a sort routine that will sort on the
+# keys of a hash as if it were a normal array.
+sub keysort {
+	local(%lines) =  @_;
+	local($i) = 0;
+	local( @sorted_lines);
+	foreach $key (sort keys(%lines)) {
+		$sorted_lines[$i] = $lines{$key};
+		$i++;
+	}
+	@sorted_lines;
+}
+
+# This is a sort routine that will sort on the
+# values of a hash as if it were a normal array.
+sub valsort{
+	local(%lines) =  @_;
+	local($i) = 0;
+	local( @sorted_lines);
+	foreach $key (sort values %lines) {
+		$sorted_lines[$i] = $key;
+		$i++;
+	}
+	@sorted_lines;
+}
+
+# This is a numerical sort routine (ascending).
+sub numsort {
+	local(%lines) =  @_;
+	local($i) = 0;
+	local( @sorted_lines);
+	foreach $num (sort {$a <=> $b} keys %lines) {
+		$sorted_lines[$i] = $lines{$num};
+		$i++;
+	}
+	@sorted_lines;
+}
+
+# This is a sort routine that will sort on the
+# ip address when the ip address is anywhere in
+# the strings.
+sub ipsort {
+	local(%lines) =  @_;
+	local($i) = 0;
+	local( @sorted_lines);
+	foreach $addr (sort sortbyipaddr keys %lines) {
+		$sorted_lines[$i] = $lines{$addr};
+		$i++;
+	}
+	@sorted_lines;
+}
+
+# These two routines will sort based upon IP addresses
+sub ipaddrval {
+	my( @a) = ($_[0] =~ m#^(\d+)\.(\d+)\.(\d+)\.(\d+)$#);
+	$a[3] + 256 * ($a[2] + 256 * ($a[1] +256 * $a[0]));
+}
+sub sortbyipaddr {
+	&ipaddrval($a) <=> &ipaddrval($b);
+}
+
+# This routine parses "get system"
+sub GetSystem {
+	print STDERR "    In GetSystem: $_" if ($debug);
+
+	my $priv_key;
+	while (<INPUT>) {
+		tr/\015//d;
+		next if /^\s*$/;
+		last if (/$prompt/);
+
+		#next if (/^System Time:/i);
+		#next if (/^\s*Virus-DB: .*/);
+		#next if (/^\s*Extended DB: .*/);
+		#next if (/^\s*IPS-DB: .*/);
+		#next if (/^FortiClient application signature package:/);
+		ProcessHistory("","","","#$_");
+	}
+	ProcessHistory("SYSTEM","","","\n");
+	return(0);
+}
+
+sub GetFile {
+	print STDERR "    In GetFile: $_" if ($debug);
+
+	while (<INPUT>) {
+		last if (/$prompt/);
+	}
+	ProcessHistory("FILE","","","\n");
+	return(0);
+}
+
+sub GetConf {
+	print STDERR "    In GetConf: $_" if ($debug);
+	my $password_counter=0;
+	while (<INPUT>) {
+		tr/\015//d;
+		next if /^\s*$/;
+		last if (/$prompt/);
+
+		if (/^create account / && $filter_pwds > 0 ) {
+			$password_counter=2;
+			ProcessHistory("","","","#$_");
+			next;
+		}
+		elsif ($password_counter > 0) {
+			$password_counter--;
+			ProcessHistory("","","","#<removed>\n");
+			next;
+		}
+		
+		ProcessHistory("","","","$_");
+	}
+	$found_end = 1;
+	return(1);
+}
+=cut
+# dummy function
+sub DoNothing {print STDOUT;}
+
+# Main
+#@commandtable - это массив
+@commandtable = (
+	{'config show'		=> 'GetSystem'},
+	#{'config show ifc'	=> 'GetConf'}
+);
+
+
+# Use an array to preserve the order of the commands and a hash for mapping
+# commands to the subroutine and track commands that have been completed.
+@commands = map(keys(%$_),  @commandtable);
+%commands = map(%$_,  @commandtable);
+
+$cisco_cmds=join(";", @commands);
+$cmds_regexp = join("|", map quotemeta($_),  @commands);
+#print('\nCMDS:\n');
+#print($cisco_cmds);
+
+
+if (length($host) == 0) {
+	if ($file) {
+		print(STDERR "Too few arguments: file name required\n");
+		exit(1);
+	} else {
+		print(STDERR "Too few arguments: host name required\n");
+		exit(1);
+	}
+}
+
+
+open(OUTPUT,">$host.new") || die "Can't open $host.new for writing: $!\n";
+select(OUTPUT);
+
+# make OUTPUT unbuffered if debugging
+if ($debug) { $| = 1; }
+
+if ($file) {
+	print STDERR "opening file $host\n" if ($debug);
+	print STDOUT "opening file $host\n" if ($log);
+	open(INPUT,"<$host") || die "open failed for $host: $!\n";
+} else {
+	print STDERR "executing rwrlogin -t $timeo -c\"$cisco_cmds\" $host\n" if ($debug);
+	print STDOUT "executing rwrlogin -t $timeo -c\"$cisco_cmds\" $host\n" if ($log);
+	
+	if (defined($ENV{NOPIPE})) {
+		print STDERR "executing with environment";
+		system "./rwrlogin -t $timeo -c \"$cisco_cmds\" $host </dev/null > $host.raw 2>&1" || die "rwrlogin failed for $host: $!\n";  #сохраняем вывод tcl в файл host.raw
+		open(INPUT, "< $host.raw") || die "rwrlogin failed for $host: $!\n";
+		#open(STDERR, "< $host.raw") || die "rwrlogin failed for $host: $!\n";
+	} else {
+		print STDERR "executing NOT env. Host:$host\n";
+		open(INPUT,"/var/lib/rancid/bin/rwrlogin -t $timeo -c \"$cisco_cmds\" $host </dev/null |") || die "rwrlogin failed for $host: $!\n";
+		#open(STDERR,"/var/lib/rancid/bin/rwrlogin -t $timeo -c \"$cisco_cmds\" $host </dev/null |") || die "rwrlogin failed for $host: $!\n";
+		#system "pwd";
+	}
+}
+
+
+=comment
+# determine ACL sorting mode
+if ($ENV{"ACLSORT"} =~ /no/i) {
+    $aclsort = "";
+}
+# determine community string filtering mode
+if (defined($ENV{"NOCOMMSTR"}) &&
+    ($ENV{"NOCOMMSTR"} =~ /yes/i || $ENV{"NOCOMMSTR"} =~ /^$/)) {
+    $filter_commstr = 1;
+} else {
+    $filter_commstr = 0;
+}
+# determine password filtering mode
+if ($ENV{"FILTER_PWDS"} =~ /no/i) {
+    $filter_pwds = 0;
+} elsif ($ENV{"FILTER_PWDS"} =~ /all/i) {
+    $filter_pwds = 2;
+} else {
+    $filter_pwds = 1;
+}
+=cut
+
+ProcessHistory("","","","#RANCID-CONTENT-TYPE: RWR-DEVICES\n\n");
+=comment
+foreach $line ( <INPUT> ) {
+	chomp( $line );
+	#print "$line\n";
+	#ProcessHistory("","","","$line");
+}
+ProcessHistory("","","","#END\n\n");
+=cut
+
+my $yes_no = 0;
+TOP: while(<INPUT>) {													#---------------------- где-то здесь идет обработка строк
+	#print STDERR ("===========>>>>>>>>$_") if ($debug);
+	tr/\015//d;
+	tr/\033//d;
+	#tr/more//d;
+	#tr/\[6c.*$//d;
+	#if (/Login:/) {
+	#	print STDOUT ("$host rwrancid!!!!!!!!!");
+	#}
+	#tr/Tmeut//d;
+	#tr/Cmmad//d;
+	#tr/Ruter//d; 
+	#tr/\{telet\}//d;
+	#tr/spaw telet//d;
+	#tr/Login://d;
+	s/\-\-.+more.+\-\-\s+//g;
+	tr/^.+>//d;
+	
+	
+	if (/^Error:/) {
+		print STDOUT ("$host dllogin error: $_");
+		print STDERR ("$host dllogin error: $_") if ($debug);
+		last;
+	}
+	
+	if (/.*COMMAND.*/) {
+		#print STDERR ("==============>: $1");
+		$yes_no = 1;
+	}
+	
+	if ($yes_no) {
+		ProcessHistory("","","","$_");
+	}
+}
+
+
+
+#print(<INPUT>);
+#while(<INPUT>) {
+#	print(<INPUT>);
+#}
+
+#print STDOUT "Done $logincmd: $_\n" if ($log);
+# Flush History
+ProcessHistory("","","","");
+# Cleanup
+close(INPUT);
+close(OUTPUT);
+
+if (defined($ENV{NOPIPE})) {
+	unlink("$host.raw") if (! $debug);
+}
+
+#print STDERR %commands
